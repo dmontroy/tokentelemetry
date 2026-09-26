@@ -298,6 +298,7 @@ _AGENT_BUILDERS = {
     "hermes": _api_only_buckets,
     "opencode": _api_only_buckets,
     "cline": _api_only_buckets,    # BYOK across providers, same drain shape as grok/opencode
+    "code_puppy": _api_only_buckets,
     "smallcode": _local_buckets,   # local models only — electricity, not an API charge
 }
 

@@ -154,7 +154,7 @@ _ENUMS: Dict[str, set] = {
 # name can't leak.
 _KNOWN_AGENTS = {
     "claude", "codex", "gemini", "antigravity", "qwen", "vibe",
-    "cursor", "copilot", "opencode", "hermes", "grok",
+    "cursor", "copilot", "opencode", "hermes", "grok", "code_puppy",
 }
 
 

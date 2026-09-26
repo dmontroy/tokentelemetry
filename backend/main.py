@@ -257,6 +257,14 @@ import sys
 
 HOME = Path.home()
 
+
+def _code_puppy_xdg_dir(env_var: str) -> Path:
+    """Mirror Code Puppy's XDG-vs-legacy directory contract."""
+    base = os.environ.get(env_var)
+    if base:
+        return Path(base).expanduser() / "code_puppy"
+    return HOME / ".code_puppy"
+
 # Platform-specific base directories for VS Code and Cursor
 if sys.platform == "darwin":  # macOS
     VSCODE_BASE = HOME / "Library/Application Support/Code"
@@ -285,6 +293,10 @@ OLLAMA_DIR = HOME / ".ollama"
 # _scan_pi_sessions.
 PI_DIR = HOME / ".pi" / "agent"
 PI_SESSIONS_DIR = PI_DIR / "sessions"
+CODE_PUPPY_STATE_DIR = _code_puppy_xdg_dir("XDG_STATE_HOME")
+CODE_PUPPY_LOGS_DIR = CODE_PUPPY_STATE_DIR / "logs"
+CODE_PUPPY_MODEL_USAGE_LOG = CODE_PUPPY_LOGS_DIR / "model_usage.jsonl"
+CODE_PUPPY_SESSION_TRANSCRIPTS_DIR = CODE_PUPPY_LOGS_DIR / "session_transcripts"
 HF_DIR = HOME / ".cache/huggingface"
 OPENCODE_DB = HOME / ".local/share/opencode/opencode.db"
 # Hermes installs to ~/.hermes by default, but the agent honors HERMES_HOME for
@@ -2107,6 +2119,7 @@ def _list_available_agents() -> list:
     if _hermes_dbs(): agents.append("hermes")
     if GROK_SESSIONS_DIR.exists(): agents.append("grok")
     if PI_SESSIONS_DIR.exists(): agents.append("pi")
+    if _code_puppy_sources_exist(): agents.append("code_puppy")
     if (CLINE_DIR / "data" / "db" / "sessions.db").exists() or (CLINE_VSCODE_DIR / "state" / "taskHistory.json").exists():
         agents.append("cline")
     # SmallCode traces are project-local; cheaply check only the explicitly
@@ -2474,6 +2487,340 @@ def _scan_smallcode_sessions(roots: Iterable[str]) -> List[Dict[str, Any]]:
             })
 
     return out
+
+
+def _code_puppy_sources_exist() -> bool:
+    if CODE_PUPPY_MODEL_USAGE_LOG.exists():
+        return True
+    if CODE_PUPPY_SESSION_TRANSCRIPTS_DIR.is_dir():
+        return any(CODE_PUPPY_SESSION_TRANSCRIPTS_DIR.glob("*.jsonl"))
+    return False
+
+
+def _parse_code_puppy_timestamp(value: Any, fallback: Optional[datetime] = None) -> datetime:
+    if isinstance(value, str) and value.strip():
+        try:
+            return _aware(datetime.fromisoformat(value.replace("Z", "+00:00")))
+        except Exception:
+            pass
+    return _aware(fallback)
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except Exception:
+        return 0
+
+
+def _truncate_text(text: Any, limit: int = 200) -> str:
+    if not isinstance(text, str):
+        return ""
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)] + "..."
+
+
+def _code_puppy_transcript_path(session_id: str) -> Path:
+    safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in str(session_id))
+    return CODE_PUPPY_SESSION_TRANSCRIPTS_DIR / f"{safe}.jsonl"
+
+
+def _read_code_puppy_transcript(path: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(row, dict):
+                    rows.append(row)
+    except OSError:
+        return []
+    rows.sort(key=lambda r: (_safe_int(r.get("sequence")), str(r.get("logged_at") or "")))
+    return rows
+
+
+def _code_puppy_usage_from_metadata(meta: Any) -> Dict[str, int]:
+    if not isinstance(meta, dict):
+        meta = {}
+    gross_input = _safe_int(meta.get("usage_input_tokens"))
+    output = _safe_int(meta.get("usage_output_tokens"))
+    cached_read = _safe_int(meta.get("usage_cached_read_tokens"))
+    cached_write = _safe_int(meta.get("usage_cached_write_tokens"))
+    net_input = max(0, gross_input - cached_read - cached_write)
+    return {
+        "input": net_input,
+        "output": output,
+        "cached": cached_read,
+        "cache_creation": cached_write,
+        "total": net_input + output + cached_read + cached_write,
+    }
+
+
+def _code_puppy_result_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        text = value.get("text")
+        if isinstance(text, str) and text.strip():
+            return text
+        try:
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            return str(value)
+    return str(value)
+
+
+def _scan_code_puppy_transcript_sessions() -> List[Dict[str, Any]]:
+    if not CODE_PUPPY_SESSION_TRANSCRIPTS_DIR.is_dir():
+        return []
+
+    sessions: List[Dict[str, Any]] = []
+    for path in sorted(CODE_PUPPY_SESSION_TRANSCRIPTS_DIR.glob("*.jsonl")):
+        rows = _read_code_puppy_transcript(path)
+        if not rows:
+            continue
+
+        sid = str(rows[0].get("session_id") or "").strip()
+        if not sid:
+            continue
+
+        source_ts = _file_mtime_utc(path)
+        latest_ts = source_ts
+        latest_model = None
+        latest_agent = None
+        latest_prompt = ""
+        mcp_tools: List[str] = []
+        successful_calls = 0
+        failed_calls = 0
+        response_chars = 0
+        agents_used: List[str] = []
+        models_used: List[str] = []
+        tokens = {
+            "input": 0, "output": 0, "cached": 0,
+            "cache_creation": 0, "total": 0, "cost": 0.0,
+        }
+
+        for row in rows:
+            ts = _parse_code_puppy_timestamp(row.get("logged_at"), source_ts)
+            if ts > latest_ts:
+                latest_ts = ts
+            event = row.get("event")
+            if event == "user_prompt" and isinstance(row.get("text"), str) and row["text"].strip():
+                latest_prompt = row["text"].strip()
+            elif event == "tool_start":
+                tool_name = row.get("tool_name")
+                if isinstance(tool_name, str) and tool_name and tool_name not in mcp_tools:
+                    mcp_tools.append(tool_name)
+            elif event == "run_start":
+                agent_name = row.get("agent_name")
+                model_name = row.get("model_name")
+                if isinstance(agent_name, str) and agent_name and agent_name not in agents_used:
+                    agents_used.append(agent_name)
+                if isinstance(model_name, str) and model_name and model_name not in models_used:
+                    models_used.append(model_name)
+                latest_agent = agent_name or latest_agent
+                latest_model = model_name or latest_model
+            elif event == "run_end":
+                agent_name = row.get("agent_name")
+                model_name = row.get("model_name")
+                if isinstance(agent_name, str) and agent_name and agent_name not in agents_used:
+                    agents_used.append(agent_name)
+                if isinstance(model_name, str) and model_name and model_name not in models_used:
+                    models_used.append(model_name)
+                latest_agent = agent_name or latest_agent
+                latest_model = model_name or latest_model
+
+                success = bool(row.get("success"))
+                if success:
+                    successful_calls += 1
+                else:
+                    failed_calls += 1
+
+                response_text = row.get("response_text")
+                if isinstance(response_text, str):
+                    response_chars += len(response_text)
+
+                usage_meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+                usage = _code_puppy_usage_from_metadata(usage_meta)
+                row_cost = calculate_cost(
+                    model_name,
+                    usage["input"],
+                    usage["output"],
+                    usage["cached"],
+                    cache_creation_tokens=usage["cache_creation"],
+                )
+                for key in ("input", "output", "cached", "cache_creation", "total"):
+                    tokens[key] += usage[key]
+                tokens["cost"] += row_cost
+
+        display = _truncate_text(latest_prompt, 140)
+        if not display:
+            head = latest_agent or "Code Puppy"
+            display = f"{head} session {sid[:8]}"
+
+        sessions.append({
+            "id": sid,
+            "agent": "code_puppy",
+            "project": "unknown",
+            "timestamp": latest_ts,
+            "display": display,
+            "tokens": tokens,
+            "mcp_tools": mcp_tools,
+            "has_plan": False,
+            "plans": [],
+            "model": latest_model,
+            "artifacts": [{
+                "name": path.name,
+                "path": str(path),
+                "type": "document",
+            }],
+            "cost": tokens["cost"],
+            "code_puppy": {
+                "agents_used": sorted(agents_used),
+                "models_used": sorted(models_used),
+                "successful_calls": successful_calls,
+                "failed_calls": failed_calls,
+                "response_chars": response_chars,
+                "transcript_events": len(rows),
+                "source": "session_transcript",
+            },
+        })
+
+    return sessions
+
+
+def _scan_code_puppy_usage_sessions() -> List[Dict[str, Any]]:
+    if not CODE_PUPPY_MODEL_USAGE_LOG.exists():
+        return []
+
+    out: Dict[str, Dict[str, Any]] = {}
+    source_ts = _file_mtime_utc(CODE_PUPPY_MODEL_USAGE_LOG)
+
+    try:
+        with open(CODE_PUPPY_MODEL_USAGE_LOG, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+
+                sid = str(row.get("session_id") or "").strip()
+                if not sid:
+                    continue
+
+                ts_raw = row.get("timestamp")
+                try:
+                    ts = _aware(datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))) if ts_raw else source_ts
+                except Exception:
+                    ts = source_ts
+
+                model = row.get("model")
+                agent_name = row.get("agent_name") or "unknown"
+                success = bool(row.get("success"))
+                response_chars = int(row.get("response_chars") or 0)
+                usage = row.get("usage") or {}
+                if not isinstance(usage, dict):
+                    usage = {}
+
+                gross_input = int(usage.get("input_tokens") or 0)
+                output = int(usage.get("output_tokens") or 0)
+                cached_read = int(usage.get("cached_read_tokens") or 0)
+                cached_write = int(usage.get("cached_write_tokens") or 0)
+                net_input = max(0, gross_input - cached_read - cached_write)
+                row_cost = calculate_cost(
+                    model,
+                    net_input,
+                    output,
+                    cached_read,
+                    cache_creation_tokens=cached_write,
+                )
+
+                sess = out.get(sid)
+                if sess is None:
+                    sess = {
+                        "id": sid,
+                        "agent": "code_puppy",
+                        "project": "unknown",
+                        "timestamp": ts,
+                        "display": f"{agent_name} session {sid[:8]}",
+                        "tokens": {
+                            "input": 0, "output": 0, "cached": 0,
+                            "cache_creation": 0, "total": 0, "cost": 0.0,
+                        },
+                        "mcp_tools": [],
+                        "has_plan": False,
+                        "plans": [],
+                        "model": model,
+                        "artifacts": [{
+                            "name": CODE_PUPPY_MODEL_USAGE_LOG.name,
+                            "path": str(CODE_PUPPY_MODEL_USAGE_LOG),
+                            "type": "document",
+                        }],
+                        "cost": 0.0,
+                        "code_puppy": {
+                            "agents_used": [],
+                            "models_used": [],
+                            "successful_calls": 0,
+                            "failed_calls": 0,
+                            "response_chars": 0,
+                            "source": "usage_log",
+                        },
+                    }
+                    out[sid] = sess
+
+                tk = sess["tokens"]
+                tk["input"] += net_input
+                tk["output"] += output
+                tk["cached"] += cached_read
+                tk["cache_creation"] += cached_write
+                tk["total"] = tk["input"] + tk["output"] + tk["cached"] + tk["cache_creation"]
+                tk["cost"] += row_cost
+
+                if ts > sess["timestamp"]:
+                    sess["timestamp"] = ts
+                    sess["model"] = model or sess.get("model")
+
+                cp = sess["code_puppy"]
+                if agent_name not in cp["agents_used"]:
+                    cp["agents_used"].append(agent_name)
+                if model and model not in cp["models_used"]:
+                    cp["models_used"].append(model)
+                if success:
+                    cp["successful_calls"] += 1
+                else:
+                    cp["failed_calls"] += 1
+                cp["response_chars"] += response_chars
+    except OSError:
+        return []
+
+    for sess in out.values():
+        sess["cost"] = sess["tokens"]["cost"]
+        cp = sess["code_puppy"]
+        cp["agents_used"].sort()
+        cp["models_used"].sort()
+    return list(out.values())
+
+
+def _scan_code_puppy_sessions() -> List[Dict[str, Any]]:
+    sessions = _scan_code_puppy_transcript_sessions()
+    if sessions:
+        return sessions
+    return _scan_code_puppy_usage_sessions()
 
 
 def _scan_cline_sessions() -> List[Dict[str, Any]]:
@@ -4877,6 +5224,9 @@ def _scan_sessions_sync():
     # 8b2. Pi Coding Agent — one JSONL per session under ~/.pi/agent/sessions/
     sessions.extend(_scan_pi_sessions())
 
+    # 8b3. Code Puppy — usage-only session rows from model_usage.jsonl.
+    sessions.extend(_scan_code_puppy_sessions())
+
     # 8c. SmallCode — traces are PROJECT-LOCAL (<project>/.smallcode/traces/),
     # so discover roots from projects already seen from other agents (they ran
     # somewhere real) unioned with any user-configured extra roots, then scan.
@@ -5487,6 +5837,135 @@ async def get_session_detail(session_id: str, agent: str):
                         pass
                 events.append(norm)
         return events
+
+    elif agent == "code_puppy":
+        transcript_path = _code_puppy_transcript_path(session_id)
+        if transcript_path.exists():
+            rows = _read_code_puppy_transcript(transcript_path)
+            if not rows:
+                return {"error": "Not found"}
+
+            events: List[Dict[str, Any]] = []
+            source_ts = _file_mtime_utc(transcript_path)
+            for row in rows:
+                ts = _parse_code_puppy_timestamp(row.get("logged_at"), source_ts)
+                norm_ts = ts.timestamp() * 1000
+                event = row.get("event")
+                if event == "user_prompt":
+                    text = row.get("text")
+                    if isinstance(text, str) and text.strip():
+                        events.append({
+                            "type": "user",
+                            "message": {
+                                "role": "user",
+                                "content": [{"type": "text", "text": text}],
+                            },
+                            "normalized_timestamp": norm_ts,
+                        })
+                elif event == "run_end":
+                    response_text = row.get("response_text")
+                    if not isinstance(response_text, str) or not response_text.strip():
+                        if row.get("error"):
+                            response_text = f"Run failed: {row['error']}"
+                        else:
+                            response_text = f"Run {'succeeded' if row.get('success') else 'ended'} with no response text."
+                    usage_meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+                    usage = _code_puppy_usage_from_metadata(usage_meta)
+                    model = row.get("model_name") or usage_meta.get("model") or "unknown"
+                    message: Dict[str, Any] = {
+                        "role": "assistant",
+                        "model": model,
+                        "content": [{"type": "text", "text": response_text}],
+                        "usage": {
+                            "input_tokens": usage["input"],
+                            "output_tokens": usage["output"],
+                            "cache_read_input_tokens": usage["cached"],
+                            "cache_creation_input_tokens": usage["cache_creation"],
+                        },
+                    }
+                    if row.get("error"):
+                        message["error"] = row.get("error")
+                    events.append({
+                        "type": "assistant",
+                        "message": message,
+                        "normalized_timestamp": norm_ts,
+                    })
+                elif event == "tool_start":
+                    events.append({
+                        "type": "tool_call",
+                        "payload": {
+                            "tool": row.get("tool_name") or "unknown",
+                            "args": row.get("tool_args") if isinstance(row.get("tool_args"), dict) else {},
+                        },
+                        "normalized_timestamp": norm_ts,
+                    })
+                elif event == "tool_end":
+                    events.append({
+                        "type": "tool_result",
+                        "payload": {
+                            "tool": row.get("tool_name") or "unknown",
+                            "content": _code_puppy_result_text(row.get("result_summary")),
+                            "is_error": not bool(row.get("success", True)),
+                        },
+                        "normalized_timestamp": norm_ts,
+                    })
+            return events if events else {"error": "Not found"}
+
+        if not CODE_PUPPY_MODEL_USAGE_LOG.exists():
+            return {"error": "Not found"}
+        events: List[Dict[str, Any]] = []
+        try:
+            with open(CODE_PUPPY_MODEL_USAGE_LOG, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    if not isinstance(row, dict) or row.get("session_id") != session_id:
+                        continue
+
+                    ts_raw = row.get("timestamp")
+                    norm_ts = None
+                    if ts_raw:
+                        try:
+                            norm_ts = _aware(datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))).timestamp() * 1000
+                        except Exception:
+                            norm_ts = None
+
+                    usage = row.get("usage") or {}
+                    if not isinstance(usage, dict):
+                        usage = {}
+                    gross_input = int(usage.get("input_tokens") or 0)
+                    cached_read = int(usage.get("cached_read_tokens") or 0)
+                    cached_write = int(usage.get("cached_write_tokens") or 0)
+                    output = int(usage.get("output_tokens") or 0)
+                    net_input = max(0, gross_input - cached_read - cached_write)
+                    total = net_input + cached_read + cached_write + output
+                    agent_name = row.get("agent_name") or "unknown"
+                    model = row.get("model") or "unknown"
+                    status = "ok" if row.get("success") else "error"
+                    text = f"{agent_name} · {model} · {status} · {total} tokens"
+
+                    events.append({
+                        "type": "assistant",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": text}],
+                            "usage": {
+                                "input_tokens": net_input,
+                                "output_tokens": output,
+                                "cache_read_input_tokens": cached_read,
+                                "cache_creation_input_tokens": cached_write,
+                            },
+                        },
+                        "normalized_timestamp": norm_ts,
+                    })
+        except OSError:
+            return {"error": "Not found"}
+        return events if events else {"error": "Not found"}
 
     elif agent in ["gemini", "antigravity"]:
         # Antigravity CLI (agy) sessions store the real per-step trajectory in

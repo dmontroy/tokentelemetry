@@ -53,6 +53,7 @@ DEFAULT_MODES: Dict[str, str] = {
     "opencode": "api",             # bring-your-own-key
     "vibe": "unknown",
     "cline": "api",                # BYOK across providers (Anthropic/OpenAI/Ollama/etc.)
+    "code_puppy": "api",           # BYOK across providers; usage log is local only
     "smallcode": "local",          # runs local models (e.g. ollama-served nemotron)
 }
 

@@ -119,6 +119,13 @@ _RETENTION: Dict[str, Dict[str, Any]] = {
         "settings_hint": None,
         "note": "CLI sessions in ~/.cline SQLite + VS Code tasks in globalStorage; no auto-pruning.",
     },
+    "code_puppy": {
+        "label": "Code Puppy",
+        "default_days": None,
+        "configurable": False,
+        "settings_hint": None,
+        "note": "Phase-1 integration reads local usage logs; transcript retention behaviour is not documented.",
+    },
     "smallcode": {
         "label": "SmallCode",
         "default_days": None,

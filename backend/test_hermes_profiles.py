@@ -56,6 +56,8 @@ def hermes_env(tmp_path, monkeypatch):
                  "COPILOT_CLI_DIR", "ANTIGRAVITY_BRAIN_DIR", "ANTIGRAVITY_CLI_DIR",
                  "PI_SESSIONS_DIR"):
         monkeypatch.setattr(main, attr, missing / attr.lower())
+    monkeypatch.setattr(main, "CODE_PUPPY_MODEL_USAGE_LOG", missing / "code_puppy.log")
+    monkeypatch.setattr(main, "CODE_PUPPY_SESSION_TRANSCRIPTS_DIR", missing / "code_puppy-transcripts")
     monkeypatch.setattr(main, "ANTIGRAVITY_BRAIN_SOURCES", [])
     monkeypatch.setattr(main, "ANTIGRAVITY_BRAIN_DIRS", [])
     monkeypatch.setattr(main, "_antigravity_cli_meta", lambda *a, **k: {})
